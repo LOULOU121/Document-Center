@@ -1,6 +1,11 @@
 version: '3.9'
 
 services:
+  ocr:
+    build: ./services/ocr
+    ports:
+      - "5001:5001"
+
   api:
     build: ./services/api
     ports:
