@@ -7,6 +7,8 @@ const express = require("express");
 const app = express();
 const port = 3000;
 const upload = multer({ dest: "uploads/" });
+const db = require('./db');
+
 
 app.use(express.json());
 
@@ -19,6 +21,11 @@ const statusMap = {}; // e.g., { "123e4567": "queued" }
 app.post("/api/documents", upload.single("file"), async (req, res) => {
   const documentId = uuidv4();
   statusMap[documentId] = "queued";
+
+  await db.query(
+    'INSERT INTO documents (id, filename, status) VALUES ($1, $2, $3)',
+    [documentId, req.file.originalname, 'queued']
+  );
 
   try {
     // ✅ 1) Mark as processing
@@ -35,6 +42,14 @@ app.post("/api/documents", upload.single("file"), async (req, res) => {
 
     // ✅ 4) OCR returns blocks
     const blocks = ocrResponse.data.blocks;
+
+    for (const block of blocks) {
+      await db.query(
+        'INSERT INTO ocr_blocks (document_id, block) VALUES ($1, $2)',
+        [documentId, block]
+      );
+    }
+
 
     // ✅ 5) For now, just log them — later you’ll save to DB
     console.log(`Blocks for ${documentId}:`, blocks);
@@ -65,7 +80,7 @@ app.get("/api/documents/:id/status", (req, res) => {
 app.post("/api/templates/spec", async (req, res) => {
   try {
     // ✅ 1) Extract OCR blocks & user instruction
-    const { blocks, instruction } = req.body;
+    const { blocks, instruction, documentId } = req.body;
 
     // ✅ 2) Build a clear system + user prompt
     const systemPrompt = `
@@ -105,6 +120,12 @@ app.post("/api/templates/spec", async (req, res) => {
       .replace(/```/g, '')
       .trim();
 
+    await db.query(
+      'INSERT INTO specs (document_id, version, spec) VALUES ($1, $2, $3)',
+      [documentId, 1, cleaned]
+    );
+
+
     res.json({ spec: cleaned });
 
 
@@ -113,6 +134,28 @@ app.post("/api/templates/spec", async (req, res) => {
     res.status(500).json({ error: "Spec generation failed" });
   }
 });
+
+app.get('/api/documents/:id', async (req, res) => {
+  const { rows } = await db.query(
+    'SELECT * FROM documents WHERE id = $1',
+    [req.params.id]
+  );
+  const blocks = await db.query(
+    'SELECT block FROM ocr_blocks WHERE document_id = $1',
+    [req.params.id]
+  );
+  res.json({ document: rows[0], blocks: blocks.rows });
+});
+
+app.get('/api/documents/:id/specs', async (req, res) => {
+  const { rows } = await db.query(
+    'SELECT version, spec, created_at FROM specs WHERE document_id = $1 ORDER BY version ASC',
+    [req.params.id]
+  );
+  res.json({ specs: rows });
+});
+
+
 
 app.listen(port, () => {
   console.log(`API server listening at http://localhost:${port}`);
