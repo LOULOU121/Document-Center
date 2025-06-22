@@ -16,6 +16,25 @@ app.get("/", (req, res) => {
   res.send("API is running ✅");
 });
 
+function safeParseLLM(raw) {
+  let cleaned = raw.replace(/```json/gi, '')
+    .replace(/```/g, '')
+    .split('#')[0]   // crude removal of trailing comment
+    .trim()
+    .replace(/'/g, '"') // single to double quotes
+    .replace(/,\s*}/g, '}')
+    .replace(/,\s*]/g, ']');
+
+  let parsed;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (err) {
+    console.error("❌ LLM output is not valid JSON. Fallback to {}. Raw:", cleaned);
+    parsed = {};
+  }
+  return parsed;
+}
+
 const statusMap = {}; // e.g., { "123e4567": "queued" }
 
 app.post("/api/documents", upload.single("file"), async (req, res) => {
@@ -81,6 +100,7 @@ app.post("/api/templates/spec", async (req, res) => {
   try {
     // ✅ 1) Extract OCR blocks & user instruction
     const { blocks, instruction, documentId } = req.body;
+    const version = await db.getNextSpecVersion(documentId);
 
     // ✅ 2) Build a clear system + user prompt
     const systemPrompt = `
@@ -115,18 +135,14 @@ app.post("/api/templates/spec", async (req, res) => {
 
     // ✅ 4) Return raw LLM response to client
     const raw = ollamaResponse.data.response;
-    const cleaned = raw
-      .replace(/```json/g, '')
-      .replace(/```/g, '')
-      .trim();
+    const parsedSpec = safeParseLLM(raw);
 
     await db.query(
       'INSERT INTO specs (document_id, version, spec) VALUES ($1, $2, $3)',
-      [documentId, 1, cleaned]
+      [documentId, version, parsedSpec]
     );
 
-
-    res.json({ spec: cleaned });
+    res.json({ spec: parsedSpec });
 
 
   } catch (error) {
@@ -154,6 +170,70 @@ app.get('/api/documents/:id/specs', async (req, res) => {
   );
   res.json({ specs: rows });
 });
+
+app.post('/api/documents/:id/specs/new', async (req, res) => {
+  try {
+    // ✅ 1️⃣ Extract URL param and body
+    const documentId = req.params.id;
+    const { instruction } = req.body;
+
+    // ✅ 2️⃣ Fetch blocks for this doc from DB
+    const { rows } = await db.query(
+      'SELECT block FROM ocr_blocks WHERE document_id = $1',
+      [documentId]
+    );
+    const blocks = rows.map(r => r.block);
+
+    // ✅ 3️⃣ Mark doc as processing
+    await db.query(
+      'UPDATE documents SET status = $1 WHERE id = $2',
+      ['processing', documentId]
+    );
+
+    // ✅ 4️⃣ Build prompt and call Ollama
+    const systemPrompt = `
+  You are a JSON bot.
+  ONLY output a single, valid, compact JSON object.
+  NO code fences. NO markdown. NO comments. NO explanation.
+  Example: {"client_name":"Jane Doe","address":"123 Example St."}
+  If unsure, just return an empty JSON object {}.
+`;
+    const userPrompt = `
+      OCR Blocks: ${JSON.stringify(blocks)}
+      Instruction: ${instruction}
+    `;
+    const ollamaResponse = await axios.post('http://ollama:11434/api/generate', {
+      model: "deepseek-coder",
+      prompt: `${systemPrompt}\n${userPrompt}`,
+      stream: false
+    });
+
+    const raw = ollamaResponse.data.response;
+    const parsedSpec = safeParseLLM(raw);
+
+    // ✅ 5️⃣ Get next version number using your helper
+    const version = await db.getNextSpecVersion(documentId);
+
+    await db.query(
+      'INSERT INTO specs (document_id, version, spec) VALUES ($1, $2, $3)',
+      [documentId, version, parsedSpec]
+    );
+
+    // ✅ 7️⃣ Mark doc as done
+    await db.query(
+      'UPDATE documents SET status = $1 WHERE id = $2',
+      ['done', documentId]
+    );
+
+    // ✅ 8️⃣ Respond
+    res.json({ spec: parsedSpec, version });
+
+  } catch (error) {
+    console.error("Spec regeneration error:", error);
+    res.status(500).json({ error: 'Spec regeneration failed' });
+  }
+});
+
 
 
 
