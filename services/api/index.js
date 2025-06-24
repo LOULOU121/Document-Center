@@ -9,6 +9,13 @@ const port = 3000;
 const upload = multer({ dest: "uploads/" });
 const db = require('./db');
 
+const cors = require('cors');
+
+// Allow your frontend origin only:
+app.use(cors({
+  origin: 'http://localhost:5173'
+}));
+
 
 app.use(express.json());
 
@@ -37,13 +44,15 @@ function safeParseLLM(raw) {
 
 const statusMap = {}; // e.g., { "123e4567": "queued" }
 
+const path = require('path');
+
 app.post("/api/documents", upload.single("file"), async (req, res) => {
   const documentId = uuidv4();
   statusMap[documentId] = "queued";
 
   await db.query(
-    'INSERT INTO documents (id, filename, status) VALUES ($1, $2, $3)',
-    [documentId, req.file.originalname, 'queued']
+    'INSERT INTO documents (id, filename, originalname, status) VALUES ($1, $2, $3, $4)',
+    [documentId, req.file.filename, req.file.originalname, 'queued']
   );
 
   try {
@@ -72,6 +81,37 @@ app.post("/api/documents", upload.single("file"), async (req, res) => {
 
     // ✅ 5) For now, just log them — later you’ll save to DB
     console.log(`Blocks for ${documentId}:`, blocks);
+
+    const systemPrompt = `
+  You are a JSON generator bot.
+  Only output a single valid JSON object.
+  No code fences. No explanations.
+  Example: {"client_name":"Jane Doe","address":"123 Example St."}
+`;
+
+    const userPrompt = `
+  OCR Blocks: ${JSON.stringify(blocks)}
+  Instruction: Extract standard fields as JSON.
+`;
+
+    const ollamaResponse = await axios.post(
+      "http://ollama:11434/api/generate",
+      {
+        model: "deepseek-coder",
+        prompt: `${systemPrompt}\n${userPrompt}`,
+        stream: false,
+      }
+    );
+
+    const raw = ollamaResponse.data.response;
+    const parsedSpec = safeParseLLM(raw);
+
+    const version = await db.getNextSpecVersion(documentId);
+
+    await db.query(
+      'INSERT INTO specs (document_id, version, spec) VALUES ($1, $2, $3)',
+      [documentId, version, parsedSpec]
+    );
 
     // ✅ 6) Mark as done
     statusMap[documentId] = "done";
@@ -233,6 +273,29 @@ app.post('/api/documents/:id/specs/new', async (req, res) => {
     res.status(500).json({ error: 'Spec regeneration failed' });
   }
 });
+
+app.get('/api/documents/:id/download', async (req, res) => {
+  const { rows } = await db.query(
+    'SELECT filename, originalname FROM documents WHERE id = $1',
+    [req.params.id]
+  );
+
+  if (rows.length === 0) {
+    return res.status(404).json({ error: 'Document not found' });
+  }
+
+  const filename = rows[0].filename;
+  const originalname = rows[0].originalname;
+  const filePath = path.join(__dirname, 'uploads', filename);
+
+  res.download(filePath, filename, (err) => {
+    if (err) {
+      console.error('File download error:', err);
+      res.status(500).send('Error downloading file.');
+    }
+  });
+});
+
 
 
 
